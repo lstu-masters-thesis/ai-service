@@ -1,4 +1,3 @@
-# src/webcam_infer.py
 import cv2
 import torch
 import numpy as np
@@ -59,12 +58,12 @@ def estimate_head_pose(landmarks, frame_shape):
     ], dtype=np.float64)
 
     model_points = np.array([
-        (0.0, 0.0, 0.0),        # Nose
-        (0.0, -63.6, -12.5),    # Chin
-        (-43.3, 32.7, -26.0),   # Left eye
-        (43.3, 32.7, -26.0),    # Right eye
-        (-28.9, -28.9, -24.1),  # Left mouth
-        (28.9, -28.9, -24.1)    # Right mouth
+        (0.0, 0.0, 0.0),        # Нос
+        (0.0, -63.6, -12.5),    # Челюсть
+        (-43.3, 32.7, -26.0),   # Левый глаз
+        (43.3, 32.7, -26.0),    # Правый глаз
+        (-28.9, -28.9, -24.1),  # Левый уголок рта
+        (28.9, -28.9, -24.1)    # Правый уголок рта
     ])
 
     focal_length = w
@@ -160,7 +159,7 @@ while True:
                 2
             )
 
-    cv2.imshow("Gaze Estimation (Head Pose Corrected)", frame)
+    cv2.imshow("Eye gaze", frame)
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
