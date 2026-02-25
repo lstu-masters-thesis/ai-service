@@ -1,100 +1,62 @@
+# webcam_infer.py
+
 import cv2
 import torch
 import numpy as np
 import mediapipe as mp
 
 from model import GazeCNN
+from geometry_attention import compute_attention
+from headpose import estimate_head_pose, estimate_distance
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ------------------------
-# Load model
-# ------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 model = GazeCNN().to(DEVICE)
-model.load_state_dict(torch.load(
-    "checkpoints/best_model.pt", map_location=DEVICE))
+model.load_state_dict(torch.load("checkpoints/best_model.pt", map_location=DEVICE))
 model.eval()
 
-# ------------------------
-# MediaPipe
-# ------------------------
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+mp_face = mp.solutions.face_mesh
+face_mesh = mp_face.FaceMesh(refine_landmarks=True)
 
-LEFT_EYE_IDX = [33, 133, 160, 159, 158, 144, 145, 153]
-RIGHT_EYE_IDX = [362, 263, 387, 386, 385, 373, 374, 380]
-
-HEAD_POSE_IDX = [1, 152, 33, 263, 61, 291]
-
-ARROW_SCALE = 200
-
-# ------------------------
-# Helpers
-# ------------------------
+# --- smoothing ---
+prev_gaze = None
+EMA_ALPHA = 0.6
 
 
-def crop_eye(frame, landmarks, indices):
+def preprocess_eye(frame, landmarks, eye_indices):
+
     h, w, _ = frame.shape
-    xs = [int(landmarks[i].x * w) for i in indices]
-    ys = [int(landmarks[i].y * h) for i in indices]
-    x1, x2 = max(min(xs) - 5, 0), min(max(xs) + 5, w)
-    y1, y2 = max(min(ys) - 5, 0), min(max(ys) + 5, h)
-    eye = frame[y1:y2, x1:x2]
-    return eye, (x1 + x2) // 2, (y1 + y2) // 2
+    points = [(int(landmarks[i].x * w), int(landmarks[i].y * h))
+              for i in eye_indices]
 
+    x_coords = [p[0] for p in points]
+    y_coords = [p[1] for p in points]
 
-def estimate_head_pose(landmarks, frame_shape):
-    h, w = frame_shape[:2]
+    x_min = max(min(x_coords) - 5, 0)
+    x_max = min(max(x_coords) + 5, w)
+    y_min = max(min(y_coords) - 5, 0)
+    y_max = min(max(y_coords) + 5, h)
 
-    image_points = np.array([
-        (landmarks[i].x * w, landmarks[i].y * h)
-        for i in HEAD_POSE_IDX
-    ], dtype=np.float64)
-
-    model_points = np.array([
-        (0.0, 0.0, 0.0),        # Нос
-        (0.0, -63.6, -12.5),    # Челюсть
-        (-43.3, 32.7, -26.0),   # Левый глаз
-        (43.3, 32.7, -26.0),    # Правый глаз
-        (-28.9, -28.9, -24.1),  # Левый уголок рта
-        (28.9, -28.9, -24.1)    # Правый уголок рта
-    ])
-
-    focal_length = w
-    center = (w / 2, h / 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
-    ], dtype="double")
-
-    dist_coeffs = np.zeros((4, 1))
-
-    success, rvec, tvec = cv2.solvePnP(
-        model_points,
-        image_points,
-        camera_matrix,
-        dist_coeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
-
-    if not success:
+    if x_max <= x_min or y_max <= y_min:
         return None
 
-    R, _ = cv2.Rodrigues(rvec)
-    return R
+    eye_crop = frame[y_min:y_max, x_min:x_max]
+
+    if eye_crop.size == 0:
+        return None
+
+    eye_crop = cv2.cvtColor(eye_crop, cv2.COLOR_BGR2GRAY)
+    eye_crop = cv2.resize(eye_crop, (55, 35))
+
+    eye_crop = eye_crop.astype(np.float32) / 255.0
+    eye_crop = np.expand_dims(eye_crop, axis=(0, 1))
+
+    return torch.from_numpy(eye_crop).to(DEVICE)
 
 
-# ------------------------
-# Webcam
-# ------------------------
 cap = cv2.VideoCapture(0)
+
 
 while True:
     ret, frame = cap.read()
@@ -105,61 +67,89 @@ while True:
     results = face_mesh.process(rgb)
 
     if results.multi_face_landmarks:
-        lm = results.multi_face_landmarks[0].landmark
+        landmarks = results.multi_face_landmarks[0].landmark
 
-        # ---- Head pose
-        R_head = estimate_head_pose(lm, frame.shape)
-        if R_head is None:
+        left_eye_idx = [33, 133, 160, 159, 158, 157, 173]
+        right_eye_idx = [263, 362, 387, 386, 385, 384, 398]
+
+        left_eye = preprocess_eye(frame, landmarks, left_eye_idx)
+        right_eye = preprocess_eye(frame, landmarks, right_eye_idx)
+
+        if left_eye is None or right_eye is None:
+            cv2.imshow("Attention Monitor", frame)
             continue
 
-        # ---- Both eyes
-        gazes = []
-        centers = []
+        with torch.no_grad():
+            gaze_left = model(left_eye)
+            gaze_right = model(right_eye)
 
-        for eye_idx in [LEFT_EYE_IDX, RIGHT_EYE_IDX]:
-            eye_img, cx, cy = crop_eye(frame, lm, eye_idx)
-            if eye_img.size == 0:
-                continue
+            gaze_left = torch.nn.functional.normalize(gaze_left, dim=1)
+            gaze_right = torch.nn.functional.normalize(gaze_right, dim=1)
 
-            gray = cv2.cvtColor(eye_img, cv2.COLOR_BGR2GRAY)
-            eye = cv2.resize(gray, (55, 35))
-            eye = eye.astype(np.float32) / 255.0
-            eye = torch.tensor(eye).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            gaze_left = gaze_left.cpu().numpy()[0]
+            gaze_right = gaze_right.cpu().numpy()[0]
 
-            with torch.no_grad():
-                gaze_eye = model(eye).cpu().numpy()[0]
+        # -----------------------------------------
+        # IMPORTANT:
+        # Right eye is mirrored horizontally
+        # -----------------------------------------
+        gaze_right[0] *= -1
 
-            gazes.append(gaze_eye)
-            centers.append((cx, cy))
+        # average both eyes
+        gaze_eye = (gaze_left + gaze_right) / 2.0
 
-        if len(gazes) == 2:
-            gaze_eye = np.mean(gazes, axis=0)
+        norm = np.linalg.norm(gaze_eye)
+        if norm > 1e-6:
+            gaze_eye = gaze_eye / norm
+        else:
+            continue
 
-            # ---- Head-corrected gaze
-            gaze_cam = R_head @ gaze_eye
-            gaze_cam = gaze_cam / np.linalg.norm(gaze_cam)
+        # -----------------------------------------
+        # Alignment UnityEyes → webcam
+        # -----------------------------------------
+        gaze_eye[0] *= -1
 
-            cx, cy = centers[0]
+        # -----------------------------------------
+        # Smoothing (EMA)
+        # -----------------------------------------
+        if prev_gaze is None:
+            prev_gaze = gaze_eye
+        else:
+            gaze_eye = EMA_ALPHA * gaze_eye + (1 - EMA_ALPHA) * prev_gaze
+            gaze_eye = gaze_eye / np.linalg.norm(gaze_eye)
+            prev_gaze = gaze_eye
 
-            end_x = int(cx + gaze_cam[0] * ARROW_SCALE)
-            end_y = int(cy - gaze_cam[1] * ARROW_SCALE)
+        R_head = estimate_head_pose(landmarks, frame.shape)
+        distance = estimate_distance(landmarks, frame.shape[1])
 
-            cv2.arrowedLine(
-                frame, (cx, cy), (end_x, end_y),
-                (0, 0, 255), 3, tipLength=0.3
+        if R_head is not None:
+
+            attention, theta, alpha = compute_attention(
+                gaze_eye,
+                R_head,
+                distance
             )
 
-            cv2.putText(
-                frame,
-                f"gaze_cam: {gaze_cam.round(2)}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
+            status = "ATTENTIVE" if attention == 1 else "NOT ATTENTIVE"
 
-    cv2.imshow("Eye gaze", frame)
+            cv2.putText(frame,
+                        f"{status}",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 255, 0) if attention else (0, 0, 255),
+                        2)
+
+            cv2.putText(frame,
+                        f"angle: {theta:.1f} / limit: {alpha:.1f}",
+                        (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2)
+
+    cv2.imshow("Attention Monitor", frame)
+
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
