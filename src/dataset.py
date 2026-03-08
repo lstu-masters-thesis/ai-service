@@ -15,7 +15,7 @@ class UnityEyesDataset(Dataset):
         look_vec: Tensor (3,), unit vector (float32)
     """
 
-    def __init__(self, h5_path):
+    def __init__(self, h5_path: str):
         self.h5_path = h5_path
 
         # Читаем метаданные один раз
@@ -56,3 +56,4 @@ class UnityEyesDataset(Dataset):
             torch.from_numpy(image),
             torch.from_numpy(look_vec),
         )
+

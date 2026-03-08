@@ -3,12 +3,24 @@
 import numpy as np
 
 
+# Минимальный физически разумный полуугол конуса внимания (в градусах)
+MIN_ALPHA_DEG = 25.0
+
+# Дополнительный мягкий запас к теоретическому конусу (в градусах)
+EXTRA_MARGIN_DEG = 10.0
+
+
 def compute_attention(gaze_eye, R_head, distance, screen_width=0.5):
     """
     gaze_eye: np.array (3,)
     R_head: np.array (3,3)  <-- rotation from solvePnP
     distance: float (meters)
     screen_width: float (meters)
+
+    ВАЖНО:
+      - решение о внимании принимается по "расширенному" конусу:
+        alpha_eff = max(alpha_theory, MIN_ALPHA_DEG) + EXTRA_MARGIN_DEG
+      - в лог выводится "чистый" теоретический alpha (без запаса).
     """
 
     # ------------------------
@@ -39,8 +51,20 @@ def compute_attention(gaze_eye, R_head, distance, screen_width=0.5):
     # ------------------------
     # Adaptive attention cone
     # ------------------------
-    alpha = np.arctan((screen_width / 2) / distance)
+    # Защита от нелепых расстояний: если оценка D совсем маленькая,
+    # считаем, что пользователь примерно на 0.4 м.
+    if distance <= 0.2:
+        distance = 0.4
 
-    attention = 1 if theta <= alpha else 0
+    alpha_theory = np.arctan((screen_width / 2) / distance)
+    alpha_deg = max(np.degrees(alpha_theory), MIN_ALPHA_DEG)
+    alpha_rad = np.radians(alpha_deg)
 
-    return attention, np.degrees(theta), np.degrees(alpha)
+    # Реальный конус для решения: теоретический + дополнительный запас
+    alpha_eff_rad = alpha_rad + np.radians(EXTRA_MARGIN_DEG)
+
+    attention = 1 if theta <= alpha_eff_rad else 0
+
+    # В лог возвращаем "чистый" alpha без EXTRA_MARGIN_DEG,
+    # чтобы видеть физический полуугол конуса.
+    return attention, np.degrees(theta), alpha_deg
